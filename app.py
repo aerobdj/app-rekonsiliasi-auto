@@ -5,6 +5,9 @@ import re
 from rapidfuzz import fuzz
 import io
 from streamlit_pdf_viewer import pdf_viewer
+import requests
+import urllib3
+from datetime import datetime
 
 # -----------------------------------------------------------------------------
 # 1. KONFIGURASI HALAMAN & BRANDING INJOURNEY
@@ -1690,8 +1693,85 @@ def reconcile_engine(df_tapping, df_manifest, airline_name):
 
     return df_res
 
+
+# Disable SSL warning untuk IP lokal self-signed
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ==============================================================================
+# INTEGRASI API PIONA
+# ==============================================================================
+BASE_URL = "https://10.10.4.49:3002/api"
+TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MTQsInVzZXJuYW1lIjoicGpwcG90cyIsInJvbGUiOiJWaWV3IiwiYWlycG9ydCI6IkJESiIsImlhdCI6MTc3OTc4NTgwMX0.ySuAIdwbmnSQtYb7kueq_KKtWRSm_lCbccvpdlerOkc"
+
+HEADERS = {
+    "Authorization": f"Bearer {TOKEN}",
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0"
+}
+ORIGIN = "BDJ"
+
+@st.cache_data(ttl=300)
+def fetch_piona_flight_list(date_str):
+    """Mengambil daftar penerbangan aktif dari API Piona berdasarkan tanggal"""
+    url = f"{BASE_URL}/reports/recap?date={date_str}&airportBranch={ORIGIN}"
+    try:
+        res = requests.get(url, headers=HEADERS, verify=False, timeout=8)
+        if res.status_code == 200:
+            recap_data = res.json().get("data", [])
+            flights = []
+            for item in recap_data:
+                fl_num = item.get("flight_number")
+                pax_cnt = item.get("total_passenger", 0)
+                if fl_num:
+                    flights.append({"flight": fl_num, "count": pax_cnt})
+            return flights
+        else:
+            st.sidebar.error(f"Gagal ambil recap API: HTTP {res.status_code}")
+            return []
+    except Exception as e:
+        st.sidebar.error(f"Gagal koneksi ke API Piona: {e}")
+        return []
+
+def fetch_piona_passenger_data(flight_list, date_str):
+    """Mengunduh data penumpang dari API Piona untuk flight yang dicentang"""
+    all_pax = []
+    
+    for flight_num in flight_list:
+        formatted_flight = flight_num.replace(" ", "+")
+        url = f"{BASE_URL}/passengers?flightDate={date_str}&origin={ORIGIN}&flightNumber={formatted_flight}&includeAll=true"
+        try:
+            res = requests.get(url, headers=HEADERS, verify=False, timeout=10)
+            if res.status_code == 200:
+                pax_data = res.json().get("data", [])
+                all_pax.extend(pax_data)
+        except Exception as e:
+            st.error(f"Gagal tarik data pax flight {flight_num}: {e}")
+
+    if not all_pax:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_pax)
+    
+    # Standardisasi nama kolom agar cocok dengan Reconcile Engine
+    df['Flight'] = df.apply(
+        lambda r: f"{r.get('flight_number', '')} ({r.get('origin', '')}-{r.get('destination', '')})", 
+        axis=1
+    )
+    
+    rename_mapping = {
+        'name': 'NAME',
+        'pnr': 'PNR',
+        'seat_number': 'SEAT',
+        'type': 'TYPE',
+        'category': 'CATEGORY',
+        'scanned_at': 'SCANNED AT'
+    }
+    df = df.rename(columns=rename_mapping)
+    return df
+
+
 # -----------------------------------------------------------------------------
-# 5. SIDEBAR & UPLOAD DOKUMEN
+# 5. SIDEBAR & INTEGRASI API PIONA
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.markdown(f"""
@@ -1705,16 +1785,35 @@ with st.sidebar:
     """, unsafe_allow_html=True)
     
     st.divider()
-    st.subheader("📁 Upload Dokumen")
-    allowed_types = ["txt", "csv", "xlsx", "xls"]
+    st.subheader("📅 1. Pilih Tanggal Flight")
+    selected_date = st.date_input("Tanggal Penerbangan:", datetime.now())
+    date_str = selected_date.strftime("%Y-%m-%d")
+
+    st.divider()
+    st.subheader("✈️ 2. Pilih Flight (API Piona)")
     
-    files_tapping = st.file_uploader(
-        "Upload File Gate Tapping (bisa >1 file):",
-        type=allowed_types,
-        accept_multiple_files=True,
-        key=f"tapping_{st.session_state['uploader_key']}"
-    )
+    with st.spinner("Mengambil daftar flight Piona..."):
+        available_flights = fetch_piona_flight_list(date_str)
+
+    selected_flights = []
+    
+    if not available_flights:
+        st.warning(f"Tidak ada data flight Piona pada tanggal {date_str}")
+    else:
+        select_all = st.checkbox("☑ Pilih Semua Flight")
         
+        for item in available_flights:
+            fl_code = item["flight"]
+            pax_cnt = item["count"]
+            label = f"{fl_code} ({pax_cnt} Pax)"
+            
+            is_checked = select_all or st.checkbox(label, value=False, key=f"chk_{fl_code}_{date_str}")
+            if is_checked:
+                selected_flights.append(fl_code)
+
+    st.divider()
+    st.subheader("📋 3. Upload Manifest")
+    
     file_manifest = st.file_uploader(
         "Upload File Manifest (PDF/TXT):",
         type=["pdf", "txt"],
@@ -1753,12 +1852,14 @@ with col_head2:
         </div>
     ''', unsafe_allow_html=True)
 
-if file_manifest and files_tapping:
-    df_tapping, scan_summary_text = load_multiple_tapping_files(files_tapping)
-    (df_manifest, flight_no_mnf, flight_date_mnf, flight_route_mnf), detected_airline = detect_and_parse_manifest(file_manifest)
-    
+if file_manifest and selected_flights:
+    with st.spinner("Tarik data penumpang dari API Piona & Memproses Rekonsiliasi..."):
+        df_tapping = fetch_piona_passenger_data(selected_flights, date_str)
+        (df_manifest, flight_no_mnf, flight_date_mnf, flight_route_mnf), detected_airline = detect_and_parse_manifest(file_manifest)
+        scan_summary_text = ", ".join(selected_flights)
+
     if df_tapping.empty:
-        st.error("❌ Proses dibatalkan karena data Gate Tapping tidak berhasil terbaca atau kosong.")
+        st.error("❌ Data Gate Tapping dari API Piona kosong untuk flight yang dicentang.")
     elif df_manifest.empty:
         st.error("❌ Proses dibatalkan karena data Manifest PDF/TXT tidak berhasil terbaca atau kosong.")
     else:
@@ -1781,7 +1882,7 @@ if file_manifest and files_tapping:
             with fc4:
                 st.markdown(f'<div class="custom-card"><div class="custom-card-label">📅 Tanggal</div><div class="custom-card-value">{flight_date_mnf}</div></div>', unsafe_allow_html=True)
             with fc5:
-                st.markdown(f'<div class="custom-card" style="border-left-color: #38bdf8;"><div class="custom-card-label">📲 Data Scan</div><div class="custom-card-value">{scan_summary_text}</div></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="custom-card" style="border-left-color: #38bdf8;"><div class="custom-card-label">📲 Data Scan Piona</div><div class="custom-card-value">{scan_summary_text}</div></div>', unsafe_allow_html=True)
             with fc6:
                 st.markdown(f'<div class="custom-card" style="border-left-color: #a855f7;"><div class="custom-card-label">📌 Manifest</div><div class="custom-card-value">{manifest_card_val}</div></div>', unsafe_allow_html=True)
 
@@ -1867,7 +1968,7 @@ if file_manifest and files_tapping:
         pax_col1, pax_col2 = st.columns(2)
         with pax_col1:
             with st.container(border=True):
-                st.markdown('<div style="font-size: 14px; font-weight: 700; color: #0284c7; margin-bottom: 8px;">📲 DATA SCAN</div>', unsafe_allow_html=True)
+                st.markdown('<div style="font-size: 14px; font-weight: 700; color: #0284c7; margin-bottom: 8px;">📲 DATA SCAN PIONA</div>', unsafe_allow_html=True)
                 ps1, ps2, ps3, ps4 = st.columns(4)
                 ps1.metric("Adult Scan", f"{scan_adult}")
                 ps2.metric("Child Scan", f"{scan_child}")
@@ -1959,12 +2060,20 @@ if file_manifest and files_tapping:
             use_container_width=True
         )
 
+elif selected_flights and not file_manifest:
+    st.info("👈 Flight Piona sudah dipilih. Silakan **upload file Passenger Manifest (PDF/TXT)** di sidebar untuk menampilkan hasil rekonsiliasi.")
+elif file_manifest and not selected_flights:
+    st.info("👈 Manifest sudah di-upload. Silakan **centang minimal satu flight Piona** di sidebar.")
 else:
     st.markdown("""
         <div class="welcome-card">
             <div class="welcome-title">Selamat Datang di E - Reconciliation System InJourney Airports</div>
             <div class="welcome-text">
-                Silakan upload file <b>Gate Tapping</b> dan <b>Passenger Manifest</b> pada sidebar di sebelah kiri. Sistem akan langsung memproses rekonsiliasi secara otomatis.
+                <b>Alur Penggunaan Otomatis:</b><br>
+                1. Pilih <b>Tanggal Flight</b> pada sidebar di sebelah kiri.<br>
+                2. <b>Centang penerbangan</b> yang ingin direkonsiliasi (Data terhubung langsung dari API Piona).<br>
+                3. Upload file <b>Passenger Manifest (PDF/TXT)</b>.<br><br>
+                <i>Sistem akan langsung memproses rekonsiliasi secara otomatis secara instan.</i>
             </div>
         </div>
     """, unsafe_allow_html=True)
