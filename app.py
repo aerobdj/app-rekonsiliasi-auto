@@ -1694,11 +1694,8 @@ def reconcile_engine(df_tapping, df_manifest, airline_name):
     return df_res
 
 
-# Disable SSL warning untuk IP lokal self-signed
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 # ==============================================================================
-# INTEGRASI API PIONA
+# INTEGRASI API PIONA DENGAN ERROR HANDLING & FALLBACK
 # ==============================================================================
 BASE_URL = "https://10.10.4.49:3002/api"
 TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MTQsInVzZXJuYW1lIjoicGpwcG90cyIsInJvbGUiOiJWaWV3IiwiYWlycG9ydCI6IkJESiIsImlhdCI6MTc3OTc4NTgwMX0.ySuAIdwbmnSQtYb7kueq_KKtWRSm_lCbccvpdlerOkc"
@@ -1715,7 +1712,7 @@ def fetch_piona_flight_list(date_str):
     """Mengambil daftar penerbangan aktif dari API Piona berdasarkan tanggal"""
     url = f"{BASE_URL}/reports/recap?date={date_str}&airportBranch={ORIGIN}"
     try:
-        res = requests.get(url, headers=HEADERS, verify=False, timeout=8)
+        res = requests.get(url, headers=HEADERS, verify=False, timeout=5)
         if res.status_code == 200:
             recap_data = res.json().get("data", [])
             flights = []
@@ -1724,54 +1721,16 @@ def fetch_piona_flight_list(date_str):
                 pax_cnt = item.get("total_passenger", 0)
                 if fl_num:
                     flights.append({"flight": fl_num, "count": pax_cnt})
-            return flights
+            return flights, True  # Status sukses
         else:
-            st.sidebar.error(f"Gagal ambil recap API: HTTP {res.status_code}")
-            return []
+            return [], False
     except Exception as e:
-        st.sidebar.error(f"Gagal koneksi ke API Piona: {e}")
-        return []
-
-def fetch_piona_passenger_data(flight_list, date_str):
-    """Mengunduh data penumpang dari API Piona untuk flight yang dicentang"""
-    all_pax = []
-    
-    for flight_num in flight_list:
-        formatted_flight = flight_num.replace(" ", "+")
-        url = f"{BASE_URL}/passengers?flightDate={date_str}&origin={ORIGIN}&flightNumber={formatted_flight}&includeAll=true"
-        try:
-            res = requests.get(url, headers=HEADERS, verify=False, timeout=10)
-            if res.status_code == 200:
-                pax_data = res.json().get("data", [])
-                all_pax.extend(pax_data)
-        except Exception as e:
-            st.error(f"Gagal tarik data pax flight {flight_num}: {e}")
-
-    if not all_pax:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(all_pax)
-    
-    # Standardisasi nama kolom agar cocok dengan Reconcile Engine
-    df['Flight'] = df.apply(
-        lambda r: f"{r.get('flight_number', '')} ({r.get('origin', '')}-{r.get('destination', '')})", 
-        axis=1
-    )
-    
-    rename_mapping = {
-        'name': 'NAME',
-        'pnr': 'PNR',
-        'seat_number': 'SEAT',
-        'type': 'TYPE',
-        'category': 'CATEGORY',
-        'scanned_at': 'SCANNED AT'
-    }
-    df = df.rename(columns=rename_mapping)
-    return df
+        # Menangkap timeout / koneksi terputus tanpa membuat app crash
+        return [], False
 
 
 # -----------------------------------------------------------------------------
-# 5. SIDEBAR & INTEGRASI API PIONA
+# SIDEBAR DENGAN MODES: API PIONA VS UPLOAD MANUAL
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.markdown(f"""
@@ -1785,52 +1744,58 @@ with st.sidebar:
     """, unsafe_allow_html=True)
     
     st.divider()
-    st.subheader("📅 1. Pilih Tanggal Flight")
-    selected_date = st.date_input("Tanggal Penerbangan:", datetime.now())
-    date_str = selected_date.strftime("%Y-%m-%d")
-
-    st.divider()
-    st.subheader("✈️ 2. Pilih Flight (API Piona)")
     
-    with st.spinner("Mengambil daftar flight Piona..."):
-        available_flights = fetch_piona_flight_list(date_str)
-
+    # Mode Pilihan Sumber Data Gate Tapping
+    source_mode = st.radio(
+        "📲 Sumber Data Gate Tapping:",
+        ["🌐 API Piona (Otomatis)", "📁 Upload Manual File"],
+        index=0
+    )
+    
     selected_flights = []
+    files_tapping_manual = []
     
-    if not available_flights:
-        st.warning(f"Tidak ada data flight Piona pada tanggal {date_str}")
-    else:
-        select_all = st.checkbox("☑ Pilih Semua Flight")
+    if source_mode == "🌐 API Piona (Otomatis)":
+        st.subheader("1. Pilih Tanggal Flight")
+        selected_date = st.date_input("Tanggal Penerbangan:", datetime.now())
+        date_str = selected_date.strftime("%Y-%m-%d")
+
+        st.subheader("2. Pilih Flight (API Piona)")
         
-        for item in available_flights:
-            fl_code = item["flight"]
-            pax_cnt = item["count"]
-            label = f"{fl_code} ({pax_cnt} Pax)"
-            
-            is_checked = select_all or st.checkbox(label, value=False, key=f"chk_{fl_code}_{date_str}")
-            if is_checked:
-                selected_flights.append(fl_code)
+        with st.spinner("Menghubungkan ke API Piona..."):
+            available_flights, is_connected = fetch_piona_flight_list(date_str)
+
+        if not is_connected:
+            st.error("⚠️ **Gagal terhubung ke API Piona (10.10.4.49:3002).**\n\nPastikan PC terhubung ke Wi-Fi / LAN Bandara BDJ atau gunakan mode **Upload Manual File** di atas.")
+        elif not available_flights:
+            st.warning(f"Tidak ada data flight Piona pada tanggal {date_str}")
+        else:
+            select_all = st.checkbox("☑ Pilih Semua Flight")
+            for item in available_flights:
+                fl_code = item["flight"]
+                pax_cnt = item["count"]
+                label = f"{fl_code} ({pax_cnt} Pax)"
+                
+                is_checked = select_all or st.checkbox(label, value=False, key=f"chk_{fl_code}_{date_str}")
+                if is_checked:
+                    selected_flights.append(fl_code)
+                    
+    else: # MODE UPLOAD MANUAL FILE
+        st.subheader("1. Upload File Gate Tapping")
+        files_tapping_manual = st.file_uploader(
+            "Upload File Gate Tapping (Excel/CSV):",
+            type=["txt", "csv", "xlsx", "xls"],
+            accept_multiple_files=True,
+            key=f"manual_tap_{st.session_state['uploader_key']}"
+        )
 
     st.divider()
-    st.subheader("📋 3. Upload Manifest")
-    
+    st.subheader("📋 Upload Manifest")
     file_manifest = st.file_uploader(
         "Upload File Manifest (PDF/TXT):",
         type=["pdf", "txt"],
         key=f"manifest_{st.session_state['uploader_key']}"
     )
-    
-    st.write("")
-    if st.button("🗑️ Reset / Mulai Awal", use_container_width=True):
-        st.session_state["uploader_key"] += 1
-        st.session_state["filter_status"] = "ALL"
-        st.rerun()
-
-    st.divider()
-    col_info, col_empty = st.columns([1, 4])
-    with col_info:
-        if st.button("ℹ️", help="Klik untuk melihat daftar maskapai terdukung", key="btn_info_pax"):
-            show_supported_airlines()
 
 # -----------------------------------------------------------------------------
 # 6. KONTEN UTAMA & TAMPILAN DASHBOARD
