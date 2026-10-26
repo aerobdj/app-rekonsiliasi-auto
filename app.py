@@ -1483,55 +1483,77 @@ def reconcile_engine(df_tapping, df_manifest, airline_name):
 
     results = []
     df_manifest["is_matched"] = False
+    
+    # Set untuk melacak baris tapping mana saja yang sudah sukses di-match di Tahap 1
+    processed_tap_indices = set()
 
     is_lion_group = "LION" in airline_name.upper() or any(code in airline_name.upper() for code in ["JT", "IW", "ID", "IU", "OD", "SL"])
 
-    # --- LANGKAH A: AMBIL DULU SEMUA EXACT SEAT MATCH (PRIORITAS UTAMA) ---
-    # Kita amankan penupang yang scan di kursi yang BENAR-BENAR SAMA dengan manifestnya
+    # -------------------------------------------------------------------------
+    # TAHAP 1: PRIORITAS UTAMA - EXACT SEAT MATCH (Seat Scan == Seat Manifest)
+    # -------------------------------------------------------------------------
     for idx, tap in df_tapping.iterrows():
         tap_nama_raw = str(tap.get("NAME", tap.get("NAMA", tap.get("PASSENGER NAME", "")))).strip()
         tap_seat = clean_seat_number(str(tap.get("SEAT", tap.get("NO SEAT", ""))).strip().replace(".", ""))
+        tap_pnr = str(tap.get("PNR", tap.get("NO PNR", ""))).strip()
         
+        raw_type = str(tap.get("TYPE", tap.get("PAX TYPE", "Adult"))).strip()
+        raw_cat = str(tap.get("CATEGORY", "")).strip()
+        is_transit = "TRANSIT" in raw_cat.upper() or "TRANSIT" in raw_type.upper()
+        tap_type_final = determine_pax_type(raw_type, is_transit)
+
         if tap_seat == "-" or tap_seat == "INF":
-            continue
-            
+            continue # Lewati baris tanpa kursi / infant di tahap ini
+
         available_manifest = df_manifest[~df_manifest["is_matched"]]
         if available_manifest.empty:
             break
-            
-        # Cari apakah ada manifest dengan SEAT YANG SAMA PERSIS dan nama mirip
+
+        # Cari manifest yang kursinya SAMA PERSIS dengan kursi scan
         same_seat_rows = available_manifest[available_manifest["seat_manifest"] == tap_seat]
-        for m_idx, m_row in same_seat_rows.iterrows():
-            score = calculate_name_score(tap_nama_raw, m_row["clean_nama_manifest"], same_seat=True)
-            if score >= 45:
-                # Tandai langsung sebagai MATCH PERFECT
-                df_manifest.at[m_idx, "is_matched"] = True
+        if not same_seat_rows.empty:
+            best_score = 0
+            best_m_idx = None
+            for m_idx, m_row in same_seat_rows.iterrows():
+                score = calculate_name_score(tap_nama_raw, m_row["clean_nama_manifest"], same_seat=True)
+                if score >= 45 and score > best_score:
+                    best_score = score
+                    best_m_idx = m_idx
+
+            if best_m_idx is not None:
+                # Kunci manifest agar tidak bisa diambil orang lain
+                df_manifest.at[best_m_idx, "is_matched"] = True
+                processed_tap_indices.add(idx)
+                m_row = df_manifest.loc[best_m_idx]
                 
                 m_section = str(m_row.get("section", "")).upper()
-                status = "🔴 OFFLOAD" if m_section in ["NO_SHOW", "THRU_NO_SHOW", "N"] else "🟢 MATCH"
-                catatan = f"Offload (No Show di seat {tap_seat})" if "OFFLOAD" in status else "Match Perfect (Seat & Name Match)"
-                
+                if m_section in ["NO_SHOW", "THRU_NO_SHOW", "N"]:
+                    status = "🔴 OFFLOAD"
+                    catatan = f"Offload (Penumpang No Show / Kode N pada seat {tap_seat})"
+                else:
+                    status = "🟢 MATCH"
+                    catatan = "Match Perfect (Seat & Name Match)"
+
                 results.append({
                     "NAMA SCAN": tap_nama_raw,
                     "SEAT SCAN": tap_seat,
-                    "PNR SCAN": str(tap.get("PNR", tap.get("NO PNR", ""))).strip(),
-                    "TYPE SCAN": determine_pax_type(str(tap.get("TYPE", "Adult")), False),
+                    "PNR SCAN": tap_pnr,
+                    "TYPE SCAN": tap_type_final,
                     "NAMA MANIFEST": m_row["clean_nama_manifest"],
                     "SEAT MANIFEST": m_row["seat_manifest"],
                     "PNR MANIFEST": m_row["pnr_manifest"],
                     "TYPE MANIFEST": m_row["type_manifest"],
                     "HASIL": status,
-                    "CATATAN": catatan,
-                    "_original_tap_index": idx # Penanda baris sudah diproses
+                    "CATATAN": catatan
                 })
-                # Simpan tanda bahwa index tapping ini sudah selesai diproses
-                df_tapping.loc[idx, "_processed"] = True
-                break
 
-    # --- LANGKAH B: PROSES SISA TAP YANG BELUM MATCH (UNTUK INFANT, CHANGE SEAT, ATAU OFFLOAD) ---
+    # -------------------------------------------------------------------------
+    # TAHAP 2: PROSES SISA TAPPING (Infant, Change Seat, Offload, Confirmation)
+    # DIJAMIN SEMUA BARIS SCAN YANG BELUM DIPROSES AKAN MASUK KE TABEL (TIDAK HILANG)
+    # -------------------------------------------------------------------------
     for idx, tap in df_tapping.iterrows():
-        if tap.get("_processed", False):
-            continue # Lewati yang sudah sukses match di Langkah A
+        if idx in processed_tap_indices:
+            continue # Lewati yang sudah sukses di Tahap 1
 
         tap_nama_raw = str(tap.get("NAME", tap.get("NAMA", tap.get("PASSENGER NAME", "")))).strip()
         tap_seat = clean_seat_number(str(tap.get("SEAT", tap.get("NO SEAT", ""))).strip().replace(".", ""))
@@ -1572,7 +1594,7 @@ def reconcile_engine(df_tapping, df_manifest, airline_name):
                 status = "👶 INFANT"
                 catatan = f"Match Infant Pax (Seat Scan {tap_seat})"
 
-        # 2. Cek Change Seat (Nama sama, tapi kursi berbeda - HANYA jika kursi tersebut belum diklaim pemilik aslinya)
+        # 2. Cek Change Seat (Nama sama, beda kursi)
         if matched_idx is None and tap_seat != "INF" and not available_manifest.empty:
             best_name_score = 0
             best_name_idx = None
@@ -1581,7 +1603,7 @@ def reconcile_engine(df_tapping, df_manifest, airline_name):
                 if m_row["seat_manifest"] == "INF":
                     continue
                 score = calculate_name_score(tap_nama_raw, m_row["clean_nama_manifest"], same_seat=False)
-                if score >= 85 and score > best_name_score: # Tingkatkan threshold sedikit jadi 85 agar lebih akurat
+                if score >= 85 and score > best_name_score:
                     best_name_score = score
                     best_name_idx = m_idx
 
@@ -1597,7 +1619,7 @@ def reconcile_engine(df_tapping, df_manifest, airline_name):
                     status = "🟠 CHANGE SEAT"
                     catatan = f"penumpang di scan seat {tap_seat} dan di manifest seat {mnf_seat}"
 
-        # 3. Simpan Hasil Jika Match / Change Seat / Infant Ditemukan
+        # 3. Simpan Hasil Match / Change Seat / Infant
         if matched_idx is not None:
             df_manifest.at[matched_idx, "is_matched"] = True
             match_row = df_manifest.loc[matched_idx]
@@ -1614,7 +1636,7 @@ def reconcile_engine(df_tapping, df_manifest, airline_name):
                 "CATATAN": catatan
             })
         else:
-            # Handle Double Tapping / Offload / Confirmation
+            # 4. Tangani Unmatched Scan (Offload / Confirmation / Double Tap)
             prev_matches = [
                 r for r in results 
                 if r["NAMA SCAN"] != "-" and 
@@ -1652,7 +1674,9 @@ def reconcile_engine(df_tapping, df_manifest, airline_name):
                 "CATATAN": catatan
             })
 
-    # --- LANGKAH C: PROSES UNMATCHED MANIFEST (NOT SCAN / GHOST PAX) ---
+    # -------------------------------------------------------------------------
+    # MANIFEST YANG TIDAK DI-SCAN (NOT SCAN / GHOST PAX)
+    # -------------------------------------------------------------------------
     unscanned = df_manifest[~df_manifest["is_matched"]]
     for m_idx, mnf in unscanned.iterrows():
         mnf_type = mnf.get("type_manifest", "Adult")
