@@ -1641,6 +1641,7 @@ def reconcile_engine(df_tapping, df_manifest, airline_name):
                 r for r in results 
                 if r["NAMA SCAN"] != "-" and 
                 clean_passenger_name(r["NAMA SCAN"]) == clean_passenger_name(tap_nama_raw) and
+                r["SEAT SCAN"] == tap_seat and # <-- SYARAT UTAMA: Kursi scan harus sama
                 ("MATCH" in r["HASIL"] or "INFANT" in r["HASIL"])
             ]
 
@@ -1648,6 +1649,7 @@ def reconcile_engine(df_tapping, df_manifest, airline_name):
                 prev_seat = prev_matches[0]["SEAT SCAN"]
                 prev_mnf_seat = prev_matches[0]["SEAT MANIFEST"]
                 seat_ref = prev_seat if prev_seat != "-" else prev_mnf_seat
+                
                 status = "🟨 CONFIRMATION"
                 catatan = f"Double Tapping / Scan 2x (Penumpang sudah Match di Seat {seat_ref})"
             elif tap_seat == "INF" or "INFANT" in tap_type_final.upper():
