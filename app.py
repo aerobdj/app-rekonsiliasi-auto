@@ -5,9 +5,6 @@ import re
 from rapidfuzz import fuzz
 import io
 from streamlit_pdf_viewer import pdf_viewer
-import requests
-import urllib3
-from datetime import datetime
 
 # -----------------------------------------------------------------------------
 # 1. KONFIGURASI HALAMAN & BRANDING INJOURNEY
@@ -346,8 +343,11 @@ def clean_amadeus_name(raw_name):
         lname = parts[0].strip()
         rest = parts[1].strip() if len(parts) > 1 else ""
         
-        rest = re.sub(r"\b(MR|MRS|MS|MSTR|MISS|MAST|MR\.|MRS\.|MS\.)\b", " ", rest)
-        rest = re.sub(r"\b(M|F|C|I)\b$", " ", rest)
+        # Hapus gelar kehormatan
+        rest = re.sub(r"\b(MR|MRS|MS|MISS|MSTR|MR\.|MRS\.|MS\.)\b", " ", rest)
+        # Hapus kode gender/pax di ujung, TAPI JANGAN HAPUS 'I' jika itu bagian dari nama (misal UWAN I)
+        # Kita hanya hapus M, F, C di ujung string jika berdiri sendiri sebagai single character
+        rest = re.sub(r"\b([MFC])\b$", " ", rest)
         
         fname = rest.strip()
         if fname:
@@ -678,7 +678,6 @@ def parse_manifest_generic_report_from_text(full_text, default_code="GA"):
     origin = "-"
     destination = "-"
 
-    # Ambil info Flight, Date, Origin
     fl_match = re.search(rf"\b({default_code}\s*\d{{3,4}})\s+(\d{{1,2}}[A-Z]{{3}})\s+([A-Z]{{3}})", full_text, re.IGNORECASE)
     if not fl_match:
         fl_match = re.search(r"\b([A-Z0-9]{2}\s*\d{3,4})\s+(\d{1,2}[A-Z]{3})", full_text, re.IGNORECASE)
@@ -697,19 +696,11 @@ def parse_manifest_generic_report_from_text(full_text, default_code="GA"):
         if not line_clean or line_clean.startswith("Generic Report") or line_clean.startswith("Report content") or "FLIGHT RELATED COMMENTS" in line_clean or line_clean.startswith("LIST OF"):
             continue
 
-        # REGEX AMADEUS EXACT POSITION:
-        # 1. Nomor urut + Nama Lengkap
-        # 2. Gelar opsional (MR/MRS/MS/MISS/MSTR)
-        # 3. KODE PAX/GENDER TEPAT SEBELUM ORIGIN (M = Male, F = Female, C = Child, I = Infant)
-        # 4. Route (Origin & Destination)
-        # 5. Class/Subclass
-        # 6. KODE BOARDING TEPAT SEBELUM SEAT (B = Boarded, N = No Show)
-        # 7. Nomor Seat
+        # Regex Amadeus: Menangkap nama, gelar, gender (M/F/C/I), rute, status boarding, dan nomor kursi
         pattern = r"^\d+\.\s*([A-Za-z0-9\/\+\s\.-]+?)\s+(?:(MR|MRS|MS|MISS|MSTR)\s+)?\b([AMFCI])\b\s+([A-Z]{3})\s+([A-Z]{3})\s+.*?\s+\b([BN])\b\s+([0-9]{1,3}[A-Za-z]|\d+|INF|-)?(?:\s+(\d{10,14}))?"
         match = re.search(pattern, line_clean)
         
         if not match:
-            # Fallback Pattern jika struktur sedikit bergeser
             pattern_fallback = r"^\d+\.\s*([A-Za-z0-9\/\+\s\.-]+?)\s+.*?\s+\b([BN])\b\s+0*([1-9]\d*[A-Za-z]|INF|-)"
             match_fb = re.search(pattern_fallback, line_clean)
             if match_fb:
@@ -725,7 +716,7 @@ def parse_manifest_generic_report_from_text(full_text, default_code="GA"):
                         "raw_nama_manifest": raw_name,
                         "clean_nama_manifest": clean_name,
                         "seat_manifest": clean_seat_number(seat_raw),
-                        "pnr_manifest": "DCS_AMADEUS",
+                        "pnr_manifest": "-",
                         "type_manifest": "Adult",
                         "section": section_val,
                         "is_matched": False
@@ -737,9 +728,9 @@ def parse_manifest_generic_report_from_text(full_text, default_code="GA"):
         gender_pax_code = match.group(3).upper() # M, F, C, atau I
         orig_pax = match.group(4)
         dest_pax = match.group(5)
-        board_status = match.group(6).upper()   # B atau N
+        board_status = match.group(6).upper()    # B atau N
         seat_raw = match.group(7) if match.group(7) else "-"
-        tkt_no = match.group(8) if match.group(8) else "DCS_AMADEUS"
+        tkt_no = match.group(8) if match.group(8) else "-"
 
         if origin == "-":
             origin = orig_pax
@@ -748,16 +739,21 @@ def parse_manifest_generic_report_from_text(full_text, default_code="GA"):
         clean_name = clean_amadeus_name(raw_name)
         section_val = "NO_SHOW" if board_status == "N" else "BOARDED"
         
-        # Penentuan Type Pax berdasarkan Kode Gender/Pax persis di sebelah kiri Kode Origin (BDJ)
-        if gender_pax_code == "I" or seat_raw == "INF":
+        # Penentuan Tipe Penumpang yang Lebih Aman:
+        # Jika kodenya 'I' TAPI gelarnya MRS/MR/MS atau nomor kursinya berupa kursi normal (bukan 'INF'),
+        # maka 'I' tersebut adalah inisial nama tengah (seperti UWAN I GASAN), bukan bayi.
+        seat_cleaned_check = clean_seat_number(seat_raw)
+        is_truly_infant = (gender_pax_code == "I" and seat_raw == "INF" and title_str not in ["MR", "MRS", "MS"])
+
+        if is_truly_infant:
             pax_type = "Infant"
             seat_val = "INF"
         elif gender_pax_code == "C" or title_str in ["MSTR", "MISS"]:
             pax_type = "Child"
-            seat_val = clean_seat_number(seat_raw)
-        else: # "M" atau "F"
+            seat_val = seat_cleaned_check
+        else: # Adult (M, F, atau 'I' yang menyamar sebagai inisial nama dewasa)
             pax_type = "Adult"
-            seat_val = clean_seat_number(seat_raw)
+            seat_val = seat_cleaned_check
 
         if len(clean_name) > 2:
             manifest_data.append({
@@ -809,23 +805,41 @@ def parse_manifest_navitaire_from_text(full_text, default_code="JQ"):
         if not line_str or line_str.startswith("Weight") or "Flight Close" in line_str or line_str.startswith("Totals") or line_str.startswith("Manifested") or "Pax Checked-In" in line_str or line_str.startswith("---") or "Cnt Name" in line_str or line_str.startswith("TKT:") or line_str.startswith("=") or line_str.startswith("Zone"):
             continue
 
-        if "Checked-in/Boarded:" in line_str and "Thru" not in line_str:
+        line_upper = line_str.upper()
+
+        # DETEKSI SEKSI BERDASARKAN ATURAN NAVITAIRE
+        if "THRU NO SHOW" in line_upper:
+            current_section = "THRU_NO_SHOW"
+            continue
+        elif "THRU CHECKED-IN" in line_upper or "THRU BOARDED" in line_upper:
+            current_section = "THRU_BOARDED"
+            continue
+        elif "NO SHOWS" in line_upper:
+            current_section = "NO_SHOW"
+            continue
+        elif "UNCONFIRMED" in line_upper:
+            current_section = "IGNORE"  # Abaikan bagian Unconfirmed sesuai permintaan
+            continue
+        elif "STAND-BY" in line_upper or "CHECKED-IN/BOARDED" in line_upper or "PAX CHECKED-IN" in line_upper:
             current_section = "BOARDED"
             continue
-        elif "No Shows:" in line_str and "Thru" not in line_str:
-            current_section = "NO_SHOW"
+
+        # Jika berada di seksi Unconfirmed, lewati baris data
+        if current_section == "IGNORE":
             continue
 
         if "INFT:" in line_str:
             infant_raw = line_str.replace("INFT:", "").strip()
             clean_name = clean_passenger_name(infant_raw)
             if len(clean_name) > 2:
+                is_transit = (current_section in ["THRU_BOARDED", "THRU_NO_SHOW"])
+                pax_type = determine_pax_type("Infant", is_transit)
                 manifest_data.append({
                     "raw_nama_manifest": infant_raw,
                     "clean_nama_manifest": clean_name,
                     "seat_manifest": "INF",
                     "pnr_manifest": last_parent_pnr,
-                    "type_manifest": "Infant",
+                    "type_manifest": pax_type,
                     "section": current_section,
                     "is_matched": False
                 })
@@ -853,6 +867,7 @@ def parse_manifest_navitaire_from_text(full_text, default_code="JQ"):
             seat_val = clean_seat_number(seat_raw)
             last_parent_pnr = pnr_val
 
+            # Penentuan transit murni hanya jika berada di seksi THRU
             is_transit = (current_section in ["THRU_BOARDED", "THRU_NO_SHOW"])
             pax_type = determine_pax_type("Adult", is_transit)
 
@@ -901,11 +916,26 @@ def parse_manifest_citilink_from_text(full_text):
         if not line_str:
             continue
         
-        if "Checked-in/Boarded:" in line_str and "Thru" not in line_str:
+        line_upper = line_str.upper()
+
+        # ATURAN SEKSI NAVITAIRE CITILINK
+        if "THRU NO SHOW" in line_upper:
+            current_section = "THRU_NO_SHOW"
+            continue
+        elif "THRU CHECKED-IN" in line_upper or "THRU BOARDED" in line_upper:
+            current_section = "THRU_BOARDED"
+            continue
+        elif "NO SHOWS" in line_upper or "NO SHOW" in line_upper:
+            current_section = "NO_SHOW"
+            continue
+        elif "UNCONFIRMED" in line_upper:
+            current_section = "IGNORE"
+            continue
+        elif "STAND-BY" in line_upper or "CHECKED-IN/BOARDED:" in line_upper or "CHECKED-IN" in line_upper or "PAX CHECKED-IN" in line_upper:
             current_section = "BOARDED"
             continue
-        elif "No Shows:" in line_str and "Thru" not in line_str:
-            current_section = "NO_SHOW"
+
+        if current_section == "IGNORE":
             continue
 
         if "INFT:" in line_str:
@@ -992,17 +1022,25 @@ def parse_manifest_airasia_from_text(full_text):
             continue
 
         line_upper = line_str.upper()
+
+        # ATURAN SEKSI NAVITAIRE AIRASIA
         if "THRU NO SHOW" in line_upper:
             current_section = "THRU_NO_SHOW"
             continue
         elif "THRU CHECKED-IN" in line_upper or "THRU BOARDED" in line_upper:
             current_section = "THRU_BOARDED"
             continue
-        elif "NO SHOW" in line_upper:
+        elif "NO SHOWS" in line_upper or "NO SHOW" in line_upper:
             current_section = "NO_SHOW"
             continue
-        elif "CHECKED-IN/BOARDED:" in line_upper or "CHECKED-IN" in line_upper or "PAX CHECKED-IN" in line_upper:
+        elif "UNCONFIRMED" in line_upper:
+            current_section = "IGNORE"
+            continue
+        elif "STAND-BY" in line_upper or "CHECKED-IN/BOARDED:" in line_upper or "CHECKED-IN" in line_upper or "PAX CHECKED-IN" in line_upper:
             current_section = "BOARDED"
+            continue
+
+        if current_section == "IGNORE":
             continue
 
         if "INFT:" in line_str:
@@ -1693,44 +1731,8 @@ def reconcile_engine(df_tapping, df_manifest, airline_name):
 
     return df_res
 
-
-# ==============================================================================
-# INTEGRASI API PIONA DENGAN ERROR HANDLING & FALLBACK
-# ==============================================================================
-BASE_URL = "https://10.10.4.49:3002/api"
-TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MTQsInVzZXJuYW1lIjoicGpwcG90cyIsInJvbGUiOiJWaWV3IiwiYWlycG9ydCI6IkJESiIsImlhdCI6MTc3OTc4NTgwMX0.ySuAIdwbmnSQtYb7kueq_KKtWRSm_lCbccvpdlerOkc"
-
-HEADERS = {
-    "Authorization": f"Bearer {TOKEN}",
-    "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0"
-}
-ORIGIN = "BDJ"
-
-@st.cache_data(ttl=300)
-def fetch_piona_flight_list(date_str):
-    """Mengambil daftar penerbangan aktif dari API Piona berdasarkan tanggal"""
-    url = f"{BASE_URL}/reports/recap?date={date_str}&airportBranch={ORIGIN}"
-    try:
-        res = requests.get(url, headers=HEADERS, verify=False, timeout=5)
-        if res.status_code == 200:
-            recap_data = res.json().get("data", [])
-            flights = []
-            for item in recap_data:
-                fl_num = item.get("flight_number")
-                pax_cnt = item.get("total_passenger", 0)
-                if fl_num:
-                    flights.append({"flight": fl_num, "count": pax_cnt})
-            return flights, True  # Status sukses
-        else:
-            return [], False
-    except Exception as e:
-        # Menangkap timeout / koneksi terputus tanpa membuat app crash
-        return [], False
-
-
 # -----------------------------------------------------------------------------
-# SIDEBAR DENGAN MODES: API PIONA VS UPLOAD MANUAL
+# 5. SIDEBAR & UPLOAD DOKUMEN
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.markdown(f"""
@@ -1744,58 +1746,33 @@ with st.sidebar:
     """, unsafe_allow_html=True)
     
     st.divider()
+    st.subheader("📁 Upload Dokumen")
+    allowed_types = ["txt", "csv", "xlsx", "xls"]
     
-    # Mode Pilihan Sumber Data Gate Tapping
-    source_mode = st.radio(
-        "📲 Sumber Data Gate Tapping:",
-        ["🌐 API Piona (Otomatis)", "📁 Upload Manual File"],
-        index=0
+    files_tapping = st.file_uploader(
+        "Upload File Gate Tapping (bisa >1 file):",
+        type=allowed_types,
+        accept_multiple_files=True,
+        key=f"tapping_{st.session_state['uploader_key']}"
     )
-    
-    selected_flights = []
-    files_tapping_manual = []
-    
-    if source_mode == "🌐 API Piona (Otomatis)":
-        st.subheader("1. Pilih Tanggal Flight")
-        selected_date = st.date_input("Tanggal Penerbangan:", datetime.now())
-        date_str = selected_date.strftime("%Y-%m-%d")
-
-        st.subheader("2. Pilih Flight (API Piona)")
         
-        with st.spinner("Menghubungkan ke API Piona..."):
-            available_flights, is_connected = fetch_piona_flight_list(date_str)
-
-        if not is_connected:
-            st.error("⚠️ **Gagal terhubung ke API Piona (10.10.4.49:3002).**\n\nPastikan PC terhubung ke Wi-Fi / LAN Bandara BDJ atau gunakan mode **Upload Manual File** di atas.")
-        elif not available_flights:
-            st.warning(f"Tidak ada data flight Piona pada tanggal {date_str}")
-        else:
-            select_all = st.checkbox("☑ Pilih Semua Flight")
-            for item in available_flights:
-                fl_code = item["flight"]
-                pax_cnt = item["count"]
-                label = f"{fl_code} ({pax_cnt} Pax)"
-                
-                is_checked = select_all or st.checkbox(label, value=False, key=f"chk_{fl_code}_{date_str}")
-                if is_checked:
-                    selected_flights.append(fl_code)
-                    
-    else: # MODE UPLOAD MANUAL FILE
-        st.subheader("1. Upload File Gate Tapping")
-        files_tapping_manual = st.file_uploader(
-            "Upload File Gate Tapping (Excel/CSV):",
-            type=["txt", "csv", "xlsx", "xls"],
-            accept_multiple_files=True,
-            key=f"manual_tap_{st.session_state['uploader_key']}"
-        )
-
-    st.divider()
-    st.subheader("📋 Upload Manifest")
     file_manifest = st.file_uploader(
         "Upload File Manifest (PDF/TXT):",
         type=["pdf", "txt"],
         key=f"manifest_{st.session_state['uploader_key']}"
     )
+    
+    st.write("")
+    if st.button("🗑️ Reset / Mulai Awal", use_container_width=True):
+        st.session_state["uploader_key"] += 1
+        st.session_state["filter_status"] = "ALL"
+        st.rerun()
+
+    st.divider()
+    col_info, col_empty = st.columns([1, 4])
+    with col_info:
+        if st.button("ℹ️", help="Klik untuk melihat daftar maskapai terdukung", key="btn_info_pax"):
+            show_supported_airlines()
 
 # -----------------------------------------------------------------------------
 # 6. KONTEN UTAMA & TAMPILAN DASHBOARD
@@ -1817,14 +1794,12 @@ with col_head2:
         </div>
     ''', unsafe_allow_html=True)
 
-if file_manifest and selected_flights:
-    with st.spinner("Tarik data penumpang dari API Piona & Memproses Rekonsiliasi..."):
-        df_tapping = fetch_piona_passenger_data(selected_flights, date_str)
-        (df_manifest, flight_no_mnf, flight_date_mnf, flight_route_mnf), detected_airline = detect_and_parse_manifest(file_manifest)
-        scan_summary_text = ", ".join(selected_flights)
-
+if file_manifest and files_tapping:
+    df_tapping, scan_summary_text = load_multiple_tapping_files(files_tapping)
+    (df_manifest, flight_no_mnf, flight_date_mnf, flight_route_mnf), detected_airline = detect_and_parse_manifest(file_manifest)
+    
     if df_tapping.empty:
-        st.error("❌ Data Gate Tapping dari API Piona kosong untuk flight yang dicentang.")
+        st.error("❌ Proses dibatalkan karena data Gate Tapping tidak berhasil terbaca atau kosong.")
     elif df_manifest.empty:
         st.error("❌ Proses dibatalkan karena data Manifest PDF/TXT tidak berhasil terbaca atau kosong.")
     else:
@@ -1847,7 +1822,7 @@ if file_manifest and selected_flights:
             with fc4:
                 st.markdown(f'<div class="custom-card"><div class="custom-card-label">📅 Tanggal</div><div class="custom-card-value">{flight_date_mnf}</div></div>', unsafe_allow_html=True)
             with fc5:
-                st.markdown(f'<div class="custom-card" style="border-left-color: #38bdf8;"><div class="custom-card-label">📲 Data Scan Piona</div><div class="custom-card-value">{scan_summary_text}</div></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="custom-card" style="border-left-color: #38bdf8;"><div class="custom-card-label">📲 Data Scan</div><div class="custom-card-value">{scan_summary_text}</div></div>', unsafe_allow_html=True)
             with fc6:
                 st.markdown(f'<div class="custom-card" style="border-left-color: #a855f7;"><div class="custom-card-label">📌 Manifest</div><div class="custom-card-value">{manifest_card_val}</div></div>', unsafe_allow_html=True)
 
@@ -1933,7 +1908,7 @@ if file_manifest and selected_flights:
         pax_col1, pax_col2 = st.columns(2)
         with pax_col1:
             with st.container(border=True):
-                st.markdown('<div style="font-size: 14px; font-weight: 700; color: #0284c7; margin-bottom: 8px;">📲 DATA SCAN PIONA</div>', unsafe_allow_html=True)
+                st.markdown('<div style="font-size: 14px; font-weight: 700; color: #0284c7; margin-bottom: 8px;">📲 DATA SCAN</div>', unsafe_allow_html=True)
                 ps1, ps2, ps3, ps4 = st.columns(4)
                 ps1.metric("Adult Scan", f"{scan_adult}")
                 ps2.metric("Child Scan", f"{scan_child}")
@@ -2025,20 +2000,12 @@ if file_manifest and selected_flights:
             use_container_width=True
         )
 
-elif selected_flights and not file_manifest:
-    st.info("👈 Flight Piona sudah dipilih. Silakan **upload file Passenger Manifest (PDF/TXT)** di sidebar untuk menampilkan hasil rekonsiliasi.")
-elif file_manifest and not selected_flights:
-    st.info("👈 Manifest sudah di-upload. Silakan **centang minimal satu flight Piona** di sidebar.")
 else:
     st.markdown("""
         <div class="welcome-card">
             <div class="welcome-title">Selamat Datang di E - Reconciliation System InJourney Airports</div>
             <div class="welcome-text">
-                <b>Alur Penggunaan Otomatis:</b><br>
-                1. Pilih <b>Tanggal Flight</b> pada sidebar di sebelah kiri.<br>
-                2. <b>Centang penerbangan</b> yang ingin direkonsiliasi (Data terhubung langsung dari API Piona).<br>
-                3. Upload file <b>Passenger Manifest (PDF/TXT)</b>.<br><br>
-                <i>Sistem akan langsung memproses rekonsiliasi secara otomatis secara instan.</i>
+                Silakan upload file <b>Gate Tapping</b> dan <b>Passenger Manifest</b> pada sidebar di sebelah kiri. Sistem akan langsung memproses rekonsiliasi secara otomatis.
             </div>
         </div>
     """, unsafe_allow_html=True)
