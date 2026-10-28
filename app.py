@@ -1401,13 +1401,12 @@ def parse_manifest_pelita_from_text(full_text):
 # 4. RECONCILE ENGINE & SCORING LOGIC (CHANGE SEAT & STRICT MATCHING FIX)
 # =============================================================================
 
-def calculate_name_score(tap_nama, mnf_nama, same_seat=False):
-    clean_tap = clean_passenger_name(tap_nama)
+def calculate_name_score(tap_nama_raw, mnf_nama, same_seat=False):
+    clean_tap = clean_passenger_name(tap_nama_raw)
     clean_mnf = clean_passenger_name(mnf_nama)
 
     if not clean_tap or not clean_mnf:
-        # Fallback jika nama setelah di-clean kosong (misal hanya berisi gelar RR)
-        clean_tap = re.sub(r"[^A-Z]", "", str(tap_nama).upper())
+        clean_tap = re.sub(r"[^A-Z]", "", str(tap_nama_raw).upper())
         clean_mnf = re.sub(r"[^A-Z]", "", str(mnf_nama).upper())
 
     s_sort = fuzz.token_sort_ratio(clean_tap, clean_mnf)
@@ -1422,12 +1421,10 @@ def calculate_name_score(tap_nama, mnf_nama, same_seat=False):
 
     # 1. ATURAN BILA KURSINYA SAMA (EXACT SEAT MATCH)
     if same_seat:
-        # Pengecekan Exact / Substring Tanpa Spasi
         if tap_no_space == mnf_no_space or tap_no_space in mnf_no_space or mnf_no_space in tap_no_space:
             return 98
 
-        # Pengecekan Fuzzy Ratio Tanpa Spasi (Menangani RRAJE vs RR AJENG)
-        raw_tap_ns = re.sub(r"[^A-Z]", "", str(tap_nama).upper())
+        raw_tap_ns = re.sub(r"[^A-Z]", "", str(tap_nama_raw).upper())
         raw_mnf_ns = re.sub(r"[^A-Z]", "", str(mnf_nama).upper())
         raw_no_space_ratio = fuzz.ratio(raw_tap_ns, raw_mnf_ns)
         
@@ -1467,7 +1464,9 @@ def calculate_name_score(tap_nama, mnf_nama, same_seat=False):
         has_prefix = False
         for wt in significant_tap:
             for wm in significant_mnf:
-                if len(wt) > 3 and len(wm) > 3 and (wt.startswith(wm) or wm.startswith(wt)):
+                # DIPERBAIKI DI SINI: Ubah dari len(...) > 3 menjadi len(...) >= 2 
+                # agar nama 3 huruf seperti DWI, TRI, EKA bisa diuji prefiksnya
+                if len(wt) >= 2 and len(wm) >= 2 and (wt.startswith(wm) or wm.startswith(wt)):
                     has_prefix = True
                     break
             if has_prefix:
