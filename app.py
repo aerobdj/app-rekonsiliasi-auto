@@ -316,7 +316,10 @@ def clean_passenger_name(name):
     name_str = re.sub(r"\bMUHAMAD([A-Z]+)\b", r"MUHAMAD \1", name_str)
     name_str = re.sub(r"\bMUHMR\b", "MUHAMMAD", name_str)
 
-    # Gelar Umum & Kehormatan/Kebangsawanan (Termasuk RR / RRA)
+    # TAMBAHAN BARU: Tangani gelar yang menempel langsung tanpa spasi (Contoh: DWIHERYMR -> DWIHERY)
+    name_str = re.sub(r"\b([A-Z]{3,})(MR|MRS|MS|MSTR|MISS|MAST)\b", r"\1", name_str)
+
+    # Gelar Umum & Kehormatan/Kebangsawanan
     name_str = re.sub(r"\b(MR|MRS|MS|MSTR|MISS|MAST|MR\.|MRS\.|MS\.)\b", " ", name_str)
     name_str = re.sub(r"\b(HJ|HJJ|H|RR|RRA|R\.|R\.R\.)\b", " ", name_str)
         
@@ -1409,15 +1412,22 @@ def calculate_name_score(tap_nama_raw, mnf_nama, same_seat=False):
         clean_tap = re.sub(r"[^A-Z]", "", str(tap_nama_raw).upper())
         clean_mnf = re.sub(r"[^A-Z]", "", str(mnf_nama).upper())
 
+    words_tap = clean_tap.split()
+    words_mnf = clean_mnf.split()
+
+    # TAMBAHAN BARU: Jika nama belakang sama & nama depan saling singkatan/prefix (DWIHERY vs DWI)
+    if len(words_tap) >= 1 and len(words_mnf) >= 1:
+        if words_tap[-1] == words_mnf[-1]:
+            w1, w2 = words_tap[0], words_mnf[0]
+            if (len(w1) >= 3 and len(w2) >= 3) and (w1.startswith(w2) or w2.startswith(w1)):
+                return 95  # Skor tinggi otomatis menjamin MATCH / CHANGE SEAT
+
     s_sort = fuzz.token_sort_ratio(clean_tap, clean_mnf)
     s_set = fuzz.token_set_ratio(clean_tap, clean_mnf)
     s_ratio = fuzz.ratio(clean_tap.replace(" ", ""), clean_mnf.replace(" ", ""))
 
     tap_no_space = clean_tap.replace(" ", "")
     mnf_no_space = clean_mnf.replace(" ", "")
-
-    words_tap = clean_tap.split()
-    words_mnf = clean_mnf.split()
 
     # 1. ATURAN BILA KURSINYA SAMA (EXACT SEAT MATCH)
     if same_seat:
